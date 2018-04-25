@@ -82,6 +82,326 @@ byte blue = 255;
 byte brightness = 255;
 
 
+/*********************************** Music visualizer ********************************/
+// Code taken from: https://github.com/hansjny/Natural-Nerd/blob/master/arduino/soundsread2/sound_reactive.ino
+// Original author: https://github.com/hansjny
+
+// TODO move different code blocks to appropriate section (after thumbsup)
+
+//The pin that we read sensor values form
+#define ANALOG_READ 0
+
+//Confirmed microphone low value, and max value
+#define MIC_LOW 60.0
+#define MIC_HIGH 1024.0
+/** Other macros */
+//How many previous sensor values effects the operating average?
+#define AVGLEN 5
+//How many previous sensor values decides if we are on a peak/HIGH (e.g. in a song)
+#define LONG_SECTOR 20
+
+//Mneumonics
+#define HIGH 3
+#define NORMAL 2
+
+//Arduino loop delay
+#define DELAY 1
+
+//How long do we keep the "current average" sound, before restarting the measuring
+#define MSECS 30 * 1000
+#define CYCLES MSECS / DELAY
+
+/*Sometimes readings are wrong or strange. How much is a reading allowed
+to deviate from the average to not be discarded? **/
+#define DEV_THRESH 0.8
+
+float fscale( float originalMin, float originalMax, float newBegin, float newEnd, float inputValue, float curve);
+void insert(int val, int *avgs, int len);
+int compute_average(int *avgs, int len);
+void visualize_music();
+
+//How many LEDs to we display
+int curshow = NUM_LEDS;
+
+/*Not really used yet. Thought to be able to switch between sound reactive
+mode, and general gradient pulsing/static color*/
+int mode = 0;
+
+//Showing different colors based on the mode.
+int songmode = NORMAL;
+
+//Average sound measurement the last CYCLES
+unsigned long song_avg;
+
+//The amount of iterations since the song_avg was reset
+int iter = 0;
+
+//The speed the LEDs fade to black if not relit
+float fade_scale = 1.2;
+
+//Led array
+CRGB leds[NUM_LEDS];
+
+/*Short sound avg used to "normalize" the input values.
+We use the short average instead of using the sensor input directly */
+int avgs[AVGLEN] = {-1};
+
+//Longer sound avg
+int long_avg[LONG_SECTOR] = {-1};
+
+//Keeping track how often, and how long times we hit a certain mode
+struct time_keeping {
+  unsigned long times_start;
+  short times;
+};
+
+//How much to increment or decrement each color every cycle
+struct color {
+  int r;
+  int g;
+  int b;
+};
+
+struct time_keeping high;
+struct color Color; 
+
+/*With this we can change the mode if we want to implement a general 
+lamp feature, with for instance general pulsing. Maybe if the
+sound is low for a while? */
+/*void loop() {
+  visualize_music();
+  delay(DELAY);       // delay in between reads for stability
+}*/
+
+
+/**Funtion to check if the lamp should either enter a HIGH mode,
+or revert to NORMAL if already in HIGH. If the sensors report values
+that are higher than 1.1 times the average values, and this has happened
+more than 30 times the last few milliseconds, it will enter HIGH mode. 
+TODO: Not very well written, remove hardcoded values, and make it more
+reusable and configurable.  */
+void check_high(int avg) {
+  if (avg > (song_avg/iter * 1.1))  {
+    if (high.times != 0) {
+      if (millis() - high.times_start > 200.0) {
+        high.times = 0;
+        songmode = NORMAL;
+      } else {
+        high.times_start = millis();  
+        high.times++; 
+      }
+    } else {
+      high.times++;
+      high.times_start = millis();
+
+    }
+  }
+  if (high.times > 30 && millis() - high.times_start < 50.0)
+    songmode = HIGH;
+  else if (millis() - high.times_start > 200) {
+    high.times = 0;
+    songmode = NORMAL;
+  }
+}
+
+//Main function for visualizing the sounds in the lamp
+void visualize_music() {
+  int sensor_value, mapped, avg, longavg;
+  
+  //Actual sensor value
+  sensor_value = analogRead(ANALOG_READ);
+  
+  //If 0, discard immediately. Probably not right and save CPU.
+  if (sensor_value < MIC_LOW)
+    return;
+
+  //Discard readings that deviates too much from the past avg.
+  // hmd changed fscale curve from 2 > 1
+  mapped = (float)fscale(MIC_LOW, MIC_HIGH, MIC_LOW, (float)MIC_HIGH, (float)sensor_value, 1.0);
+  avg = compute_average(avgs, AVGLEN);
+
+  if (((avg - mapped) > avg*DEV_THRESH)) //|| ((avg - mapped) < -avg*DEV_THRESH))
+    return;
+  
+  //Insert new avg. values
+  insert(mapped, avgs, AVGLEN); 
+  insert(avg, long_avg, LONG_SECTOR); 
+
+  //Compute the "song average" sensor value
+  song_avg += avg;
+  iter++;
+  if (iter > CYCLES) {  
+    song_avg = song_avg / iter;
+    iter = 1;
+  }
+    
+  longavg = compute_average(long_avg, LONG_SECTOR);
+
+  //Check if we enter HIGH mode 
+  check_high(longavg);  
+
+  if (songmode == HIGH) {
+    fade_scale = 3;
+    Color.r = 5;
+    Color.g = 3;
+    Color.b = -1;
+  }
+  else if (songmode == NORMAL) {
+    fade_scale = 2;
+    Color.r = -1;
+    Color.b = 2;
+    Color.g = 1;
+  }
+
+  //Decides how many of the LEDs will be lit
+  curshow = fscale(MIC_LOW, MIC_HIGH, 0.0, (float)NUM_LEDS, (float)avg, -1);
+
+  /*Set the different leds. Control for too high and too low values.
+          Fun thing to try: Dont account for overflow in one direction, 
+    some interesting light effects appear! */
+  for (int i = 0; i <= NUM_LEDS/2; i++) 
+    //The leds we want to show
+    if (i < curshow) {
+      if (leds[NUM_LEDS/2 + i].r + Color.r > 255)
+        leds[NUM_LEDS/2 + i].r = 255;
+      else if (leds[NUM_LEDS/2 + i].r + Color.r < 0)
+        leds[NUM_LEDS/2 + i].r = 0;
+      else
+        leds[NUM_LEDS/2 + i].r = leds[NUM_LEDS/2 + i].r + Color.r;
+          
+      if (leds[NUM_LEDS/2 + i].g + Color.g > 255)
+        leds[NUM_LEDS/2 + i].g = 255;
+      else if (leds[NUM_LEDS/2 + i].g + Color.g < 0)
+        leds[NUM_LEDS/2 + i].g = 0;
+      else 
+        leds[NUM_LEDS/2 + i].g = leds[NUM_LEDS/2 + i].g + Color.g;
+
+      if (leds[NUM_LEDS/2 + i].b + Color.b > 255)
+        leds[NUM_LEDS/2 + i].b = 255;
+      else if (leds[NUM_LEDS/2 + i].b + Color.b < 0)
+        leds[NUM_LEDS/2 + i].b = 0;
+      else 
+        leds[NUM_LEDS/2 + i].b = leds[NUM_LEDS/2 + i].b + Color.b;  
+
+      // other half 
+      
+      if (leds[NUM_LEDS/2 - i].r + Color.r > 255)
+        leds[NUM_LEDS/2 - i].r = 255;
+      else if (leds[NUM_LEDS/2 - i].r + Color.r < 0)
+        leds[NUM_LEDS/2 - i].r = 0;
+      else
+        leds[NUM_LEDS/2 - i].r = leds[NUM_LEDS/2 - i].r + Color.r;
+          
+      if (leds[NUM_LEDS/2 - i].g + Color.g > 255)
+        leds[NUM_LEDS/2 - i].g = 255;
+      else if (leds[NUM_LEDS/2 - i].g + Color.g < 0)
+        leds[NUM_LEDS/2 - i].g = 0;
+      else 
+        leds[NUM_LEDS/2 - i].g = leds[NUM_LEDS/2 - i].g + Color.g;
+
+      if (leds[NUM_LEDS/2 - i].b + Color.b > 255)
+        leds[NUM_LEDS/2 - i].b = 255;
+      else if (leds[NUM_LEDS/2 - i].b + Color.b < 0)
+        leds[NUM_LEDS/2 - i].b = 0;
+      else 
+        leds[NUM_LEDS/2 - i].b = leds[NUM_LEDS/2 - i].b + Color.b;  
+    } else {
+      leds[NUM_LEDS/2 + i] = CRGB(leds[NUM_LEDS/2 + i].r/fade_scale, leds[NUM_LEDS/2 + i].g/fade_scale, leds[NUM_LEDS/2 + i].b/fade_scale);
+      leds[NUM_LEDS/2 - i] = CRGB(leds[NUM_LEDS/2 - i].r/fade_scale, leds[NUM_LEDS/2 - i].g/fade_scale, leds[NUM_LEDS/2 - i].b/fade_scale);
+    }
+
+    
+  FastLED.show(); 
+}
+
+//Compute average of a int array, given the starting pointer and the length
+int compute_average(int *avgs, int len) {
+  int sum = 0;
+  for (int i = 0; i < len; i++)
+    sum += avgs[i];
+
+  return (int)(sum / len);
+
+}
+
+//Insert a value into an array, and shift it down removing
+//the first value if array already full 
+void insert(int val, int *avgs, int len) {
+  for (int i = 0; i < len; i++) {
+    if (avgs[i] == -1) {
+      avgs[i] = val;
+      return;
+    }  
+  }
+
+  for (int i = 1; i < len; i++) {
+    avgs[i - 1] = avgs[i];
+  }
+  avgs[len - 1] = val;
+}
+
+//Function imported from the arduino website.
+//Basically map, but with a curve on the scale (can be non-uniform).
+float fscale( float originalMin, float originalMax, float newBegin, float
+    newEnd, float inputValue, float curve){
+
+  float OriginalRange = 0;
+  float NewRange = 0;
+  float zeroRefCurVal = 0;
+  float normalizedCurVal = 0;
+  float rangedValue = 0;
+  boolean invFlag = 0;
+
+
+  // condition curve parameter
+  // limit range
+
+  if (curve > 10) curve = 10;
+  if (curve < -10) curve = -10;
+
+  curve = (curve * -.1) ; // - invert and scale - this seems more intuitive - postive numbers give more weight to high end on output 
+  curve = pow(10, curve); // convert linear scale into lograthimic exponent for other pow function
+
+  // Check for out of range inputValues
+  if (inputValue < originalMin) {
+    inputValue = originalMin;
+  }
+  if (inputValue > originalMax) {
+    inputValue = originalMax;
+  }
+
+  // Zero Refference the values
+  OriginalRange = originalMax - originalMin;
+
+  if (newEnd > newBegin){ 
+    NewRange = newEnd - newBegin;
+  }
+  else
+  {
+    NewRange = newBegin - newEnd; 
+    invFlag = 1;
+  }
+
+  zeroRefCurVal = inputValue - originalMin;
+  normalizedCurVal  =  zeroRefCurVal / OriginalRange;   // normalize to 0 - 1 float
+
+  // Check for originalMin > originalMax  - the math for all other cases i.e. negative numbers seems to work out fine 
+  if (originalMin > originalMax ) {
+    return 0;
+  }
+
+  if (invFlag == 0){
+    rangedValue =  (pow(normalizedCurVal, curve) * NewRange) + newBegin;
+
+  }
+  else     // invert the ranges
+  {   
+    rangedValue =  newBegin - (pow(normalizedCurVal, curve) * NewRange); 
+  }
+
+  return rangedValue;
+}
+/*********************************** End of music visualizer ********************************/
 
 /******************************** GLOBALS for fade/flash *******************************/
 bool stateOn = false;
@@ -218,6 +538,20 @@ void setup() {
   Serial.println("Ready");
   Serial.print("IP Address: ");
   Serial.println(WiFi.localIP());
+
+  /***** music visualizer setup ****/
+  //bootstrap average with some low values
+  for (int i = 0; i < AVGLEN; i++) {  
+    insert(250, avgs, AVGLEN);
+  }
+
+  //Initial values
+  high.times = 0;
+  high.times_start = millis();
+  Color.r = 0;  
+  Color.g = 0;
+  Color.b = 1;
+  /***** end of music visualizer setup ****/
 
 }
 
@@ -503,6 +837,12 @@ void loop() {
 
   ArduinoOTA.handle();
 
+  //EFFECT Music Visualizer
+  if(effectString == "musicVisualizer") {
+      visualize_music();
+      delay(DELAY); // delay in between reads for stability
+      // TODO add turn off support
+    }
 
   //EFFECT BPM
   if (effectString == "bpm") {
